@@ -9,7 +9,7 @@
     #app { height:100%; width:100%; position:relative; overflow:hidden; }
     video { width:100%; height:100%; object-fit:cover; background:#000; display:block; }
 
-    /* 최소 UI(상태/카운트다운만) */
+    /* 최소 UI(상태만) */
     #hud {
       position:absolute; left:0; right:0; bottom:0;
       padding:12px;
@@ -19,7 +19,7 @@
       line-height:1.4;
     }
     #status { font-weight:700; }
-    #countdown { font-size:18px; font-weight:900; margin-top:6px; }
+
     #tapToStart {
       position:absolute; inset:0;
       display:flex; align-items:center; justify-content:center;
@@ -50,32 +50,27 @@
 
     <div id="hud">
       <div id="status">대기 중…</div>
-      <div id="countdown"></div>
     </div>
   </div>
 
   <script>
     // ==========================
-    // 기존 기능 설정(유지)
+    // 기본 기능 설정(유지)
     // ==========================
     const SCAN_INTERVAL_MS = 180;   // 스캔 주기
     const COOLDOWN_MS = 1500;       // 연속 인식 방지
     const HISTORY_KEY = "qr_scan_history_v1";
     const MAX_HISTORY = 8;
 
-    // QR이 URL이 아닐 때 붙일 기본 URL (필요시 여기에 고정값을 넣거나, 아래 입력 방식으로 확장 가능)
+    // QR이 URL이 아닐 때 붙일 기본 URL (필요 시 설정)
     // 예) const BASE_URL = "https://example.com/view?code=";
     const BASE_URL = ""; // 비워두면 "QR이 URL이 아닌 경우 이동 불가"
-
-    // 2초 카운트다운 후 이동
-    const COUNTDOWN_SECONDS = 2;
 
     // ==========================
     // 엘리먼트/상태
     // ==========================
     const video = document.getElementById("video");
     const statusEl = document.getElementById("status");
-    const countdownEl = document.getElementById("countdown");
     const tapLayer = document.getElementById("tapToStart");
     const startBtn = document.getElementById("startBtn");
 
@@ -86,10 +81,9 @@
     let lastValue = "";
     let lastTime = 0;
     let navigating = false;
-    let countdownTimer = null;
 
     // ==========================
-    // 진동 + 효과음
+    // 진동 + 효과음 (유지)
     // ==========================
     let audioCtx = null;
 
@@ -106,7 +100,7 @@
         const g = ctx.createGain();
 
         o.type = "sine";
-        o.frequency.value = 880; // 고정 주파수(최소)
+        o.frequency.value = 880;
         g.gain.value = 0.0001;
 
         o.connect(g);
@@ -119,13 +113,11 @@
 
         o.start(t);
         o.stop(t + 0.13);
-      } catch (e) {
-        // 오디오 불가 환경이면 무시
-      }
+      } catch (e) {}
     }
 
     // ==========================
-    // 유틸(기록 저장은 유지)
+    // 유틸(기록 저장/URL 생성 유지)
     // ==========================
     function pushHistory(text) {
       const arr = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
@@ -153,21 +145,18 @@
     }
 
     // ==========================
-    // 전체화면 요청
+    // 전체화면 요청 (유지)
     // ==========================
     async function requestFullscreen() {
       const el = document.documentElement;
       if (document.fullscreenElement) return;
-
       try {
         if (el.requestFullscreen) await el.requestFullscreen();
-      } catch (e) {
-        // iOS Safari는 requestFullscreen 미지원인 경우가 많음 → 무시
-      }
+      } catch (e) {}
     }
 
     // ==========================
-    // 카메라/스캔
+    // 카메라/스캔 (유지 + "즉시 이동" 반영)
     // ==========================
     function initDetector() {
       if (!("BarcodeDetector" in window)) {
@@ -194,7 +183,6 @@
       }
 
       try {
-        // 기본은 후면 카메라 우선
         stream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: { ideal: "environment" } },
           audio: false
@@ -212,9 +200,6 @@
 
     function stopAll() {
       navigating = false;
-      if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
-      countdownEl.textContent = "";
-
       if (timer) { clearInterval(timer); timer = null; }
       if (stream) {
         stream.getTracks().forEach(t => t.stop());
@@ -251,17 +236,20 @@
           pushHistory(raw);
 
           const url = makeUrl(raw);
+          // 인식 성공: 진동/효과음은 유지
+          vibrate(); beep();
+
           if (!url) {
             setStatus("인식 성공! 그러나 URL로 변환할 수 없습니다 (BASE_URL 설정 필요)");
-            vibrate(); beep();
+            // 즉시 다시 스캔 가능하도록 navigating 해제
+            navigating = false;
             return;
           }
 
-          // 인식 성공 처리
+          // ✅ 변경점: 대기시간 없이 즉시 이동
           navigating = true;
-          vibrate(); beep();
-          setStatus("인식 성공! 2초 후 이동합니다");
-          startCountdownAndGo(url);
+          setStatus("이동 중…");
+          location.href = url;
 
         } catch (e) {
           // 일시적 실패 무시
@@ -269,54 +257,29 @@
       }, SCAN_INTERVAL_MS);
     }
 
-    function startCountdownAndGo(url) {
-      let left = COUNTDOWN_SECONDS;
-      countdownEl.textContent = `이동까지 ${left}…`;
-
-      countdownTimer = setInterval(() => {
-        left -= 1;
-        if (left <= 0) {
-          clearInterval(countdownTimer);
-          countdownTimer = null;
-          countdownEl.textContent = "";
-          setStatus("이동 중…");
-          // 같은 탭에서 이동(가장 확실)
-          location.href = url;
-          return;
-        }
-        countdownEl.textContent = `이동까지 ${left}…`;
-      }, 1000);
-    }
-
     // ==========================
     // 시작 버튼 (사용자 제스처 확보)
     // ==========================
     startBtn.addEventListener("click", async () => {
-      // 1) 전체화면
       await requestFullscreen();
 
-      // 2) 오디오 권한 활성화(일부 브라우저는 resume 필요)
       try {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         if (audioCtx.state === "suspended") await audioCtx.resume();
       } catch (e) {}
 
-      // 3) QR 인식기 준비
       const ok = initDetector();
       if (!ok) return;
 
-      // 4) UI 숨기고 스캔 시작
       tapLayer.style.display = "none";
       await startCamera();
     });
 
-    // 화면 탭으로도 시작되게(버튼 누르기 귀찮을 때)
     tapLayer.addEventListener("click", (e) => {
       if (e.target === startBtn) return;
       startBtn.click();
     });
 
-    // 페이지 종료 시 정리
     window.addEventListener("beforeunload", stopAll);
   </script>
 </body>
