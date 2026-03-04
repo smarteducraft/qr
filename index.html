@@ -5,36 +5,30 @@
 QR 스캐너 (Happy Together)
 
 버전 히스토리
-V1.02
-- QR 인식 후 대기시간 제거
-- 인식 즉시 웹사이트 이동
+V1.03
+- ROI 크롭/다운스케일/프레임 콜백 기반 스캔
+- 드래그/핀치 줌(지원 기기에서)
 
-(이번 수정: 코드 설정 유지 + 성능/줌 기능 추가)
-- QR 인식 속도 개선(ROI 크롭/다운스케일/프레임 콜백 루프)
-- 드래그/핀치 줌인·줌아웃(지원 기기에서)
+V1.04
+- 인식률 개선: 가변 ROI(중앙→확장→전체) + 다중 해상도 패스
+- 인식률 개선: 스캔 FPS/해상도 힌트 최적화
+- 윈도우 호환 강화: 카메라 선택, 마우스 휠/드래그 줌, 디지털 줌 폴백
+- (지원 시) 토치(플래시) 토글
 -->
 
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>QR 스캐너 V1.03</title>
+  <title>QR 스캐너 V1.04</title>
 
   <style>
     html,body{ margin:0; padding:0; height:100%; background:#000; color:#fff; }
     #app{ height:100%; width:100%; position:relative; overflow:hidden; }
-    video{ width:100%; height:100%; object-fit:cover; background:#000; display:block; touch-action:none; }
-
-    #hud{
-      position:absolute; left:0; right:0; bottom:0;
-      padding:12px;
-      background:linear-gradient(transparent,rgba(0,0,0,.55));
-      font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif;
-      font-size:14px;
-      line-height:1.4;
-      user-select:none;
+    video{
+      width:100%; height:100%;
+      object-fit:cover; background:#000; display:block;
+      touch-action:none; /* 제스처 줌 */
     }
-    #status{ font-weight:700; }
-    #zoomInfo{ opacity:.9; margin-top:6px; font-size:12px; }
 
     #tapToStart{
       position:absolute; inset:0;
@@ -43,11 +37,36 @@ V1.02
       font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif;
       text-align:center;
       padding:24px;
+      z-index:5;
     }
     #tapToStart button{
       border:0; border-radius:12px; padding:14px 18px;
       font-weight:800; font-size:16px; cursor:pointer;
     }
+
+    /* 최소 기능 HUD */
+    #hud{
+      position:absolute; left:0; right:0; bottom:0;
+      padding:10px 12px;
+      background:linear-gradient(transparent,rgba(0,0,0,.6));
+      font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif;
+      font-size:13px; line-height:1.35;
+      user-select:none;
+      z-index:4;
+    }
+    #status{ font-weight:800; }
+    #subline{ opacity:.9; margin-top:6px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    select, button.small{
+      background:rgba(255,255,255,.10);
+      border:1px solid rgba(255,255,255,.18);
+      color:#fff;
+      border-radius:10px;
+      padding:8px 10px;
+      font-size:12px;
+      outline:none;
+    }
+    button.small{ cursor:pointer; }
+    #zoomInfo{ opacity:.9; font-size:12px; margin-top:6px; }
   </style>
 </head>
 
@@ -61,7 +80,7 @@ V1.02
           QR 스캐너 (Happy Together)
         </div>
         <div style="opacity:.9;margin-bottom:14px;">
-          카메라 권한을 위해 한번 눌러주세요
+          카메라/전체화면/사운드 권한을 위해 한번 눌러주세요
         </div>
         <button id="startBtn">스캔 시작</button>
       </div>
@@ -69,22 +88,25 @@ V1.02
 
     <div id="hud">
       <div id="status">대기 중…</div>
+      <div id="subline">
+        <select id="cameraSelect" title="카메라 선택" style="min-width:180px; max-width:60vw;"></select>
+        <button id="torchBtn" class="small" style="display:none;">토치 OFF</button>
+        <button id="fsBtn" class="small">전체화면</button>
+      </div>
       <div id="zoomInfo"></div>
     </div>
   </div>
 
 <script>
 /* ==========================
-버전 정보 (기존 유지)
+버전 정보
 ========================== */
-const APP_VERSION = "V1.02";
+const APP_VERSION = "V1.04";
 
 /* ==========================
 기본 설정 (기존 유지)
 ========================== */
-const SCAN_INTERVAL_MS = 180; // (참고용) 기존값 유지. 실제 스캔은 아래 FPS 제한으로 동작.
 const COOLDOWN_MS = 1500;
-
 const HISTORY_KEY = "qr_scan_history_v1";
 const MAX_HISTORY = 8;
 
@@ -92,13 +114,21 @@ const MAX_HISTORY = 8;
 const BASE_URL = "";
 
 /* ==========================
-성능 튜닝 설정(추가)
-- ROI 크롭 + 다운스케일로 detect 비용 감소
-- 스캔 FPS 제한으로 과도한 detect 호출 방지
+인식률/성능 튜닝 (최대한 활용)
 ========================== */
-const TARGET_SCAN_FPS = 12;         // 8~15 권장(기기 성능에 따라)
-const ROI_SIZE_RATIO = 0.68;        // 화면 중앙에서 사용할 크롭 비율(0~1)
-const DOWNSCALE_MAX = 720;          // 캔버스 최대 변(픽셀). 낮을수록 빠름(480~960)
+// 스캔 FPS: 인식률↑ (너무 높으면 발열↑)
+const TARGET_SCAN_FPS = 18;
+
+// ROI 단계: 중앙→확장→전체 (치우친 QR도 잡기)
+const ROI_STEPS = [0.62, 0.82, 1.00];
+
+// 다중 해상도 패스: 작은 QR/큰 QR 모두 대응 (인식률↑)
+const PASS_MAX_SIDES = [1080, 720]; // 먼저 고해상도, 실패하면 더 빠른 해상도
+
+// 디지털 줌(하드웨어 줌이 없을 때도 동작): ROI를 더 좁혀 확대 효과
+// 1.0 = 기본, 커질수록 더 줌인(ROI가 좁아짐)
+const DIGITAL_ZOOM_MIN = 1.0;
+const DIGITAL_ZOOM_MAX = 4.0;
 
 /* ==========================
 요소
@@ -108,6 +138,9 @@ const statusEl = document.getElementById("status");
 const zoomInfoEl = document.getElementById("zoomInfo");
 const tapLayer = document.getElementById("tapToStart");
 const startBtn = document.getElementById("startBtn");
+const cameraSelect = document.getElementById("cameraSelect");
+const torchBtn = document.getElementById("torchBtn");
+const fsBtn = document.getElementById("fsBtn");
 
 let stream = null;
 let detector = null;
@@ -116,7 +149,7 @@ let lastValue = "";
 let lastTime = 0;
 let navigating = false;
 
-/* 스캔 루프 상태 */
+/* 스캔 루프 */
 let scanning = false;
 let lastScanTs = 0;
 
@@ -125,34 +158,29 @@ const canvas = document.createElement("canvas");
 const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
 /* ==========================
-진동 + 효과음 (기존 유지)
+진동 + 효과음 (유지)
 ========================== */
 let audioCtx = null;
 
 function vibrate(){
-  if(navigator.vibrate){
-    navigator.vibrate([80,60,80]);
-  }
+  if (navigator.vibrate) navigator.vibrate([80,60,80]);
 }
 
 function beep(){
   try{
-    if(!audioCtx){
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    const ctxA = audioCtx;
-
-    const o = ctxA.createOscillator();
-    const g = ctxA.createGain();
+    if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const A = audioCtx;
+    const o = A.createOscillator();
+    const g = A.createGain();
 
     o.type = "sine";
     o.frequency.value = 880;
     g.gain.value = 0.0001;
 
     o.connect(g);
-    g.connect(ctxA.destination);
+    g.connect(A.destination);
 
-    const t = ctxA.currentTime;
+    const t = A.currentTime;
     g.gain.setValueAtTime(0.0001, t);
     g.gain.exponentialRampToValueAtTime(0.2, t + 0.01);
     g.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
@@ -163,7 +191,7 @@ function beep(){
 }
 
 /* ==========================
-기록 저장 (기존 유지)
+기록 저장 (유지)
 ========================== */
 function pushHistory(text){
   const arr = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
@@ -172,42 +200,40 @@ function pushHistory(text){
 }
 
 /* ==========================
-URL 생성 (기존 유지)
+URL 생성 (유지)
 ========================== */
 function makeUrl(raw){
   const v = (raw || "").trim();
   if(!v) return null;
 
   if(/^https?:\/\//i.test(v)) return v;
-
   if(/^[\w.-]+\.[a-z]{2,}([\/?#].*)?$/i.test(v)) return "https://" + v;
 
   if(!BASE_URL) return null;
   return BASE_URL + encodeURIComponent(v);
 }
 
-function setStatus(msg){
-  statusEl.textContent = msg;
-}
+function setStatus(msg){ statusEl.textContent = msg; }
 
 /* ==========================
-전체화면 (기존 유지)
+전체화면 (유지 + 버튼 제공)
 ========================== */
 async function requestFullscreen(){
   const el = document.documentElement;
-  if(document.fullscreenElement) return;
   try{
-    if(el.requestFullscreen) await el.requestFullscreen();
+    if (!document.fullscreenElement && el.requestFullscreen) await el.requestFullscreen();
   }catch(e){}
 }
 
+fsBtn.addEventListener("click", () => requestFullscreen());
+
 /* ==========================
-QR 인식기 (기존 유지)
+QR 인식기
 ========================== */
 function initDetector(){
   if(!("BarcodeDetector" in window)){
     detector = null;
-    setStatus("QR 인식 미지원 브라우저 (Chrome/Edge 권장)");
+    setStatus("QR 인식 미지원 브라우저 (Windows는 Chrome/Edge 권장)");
     return false;
   }
   try{
@@ -221,26 +247,81 @@ function initDetector(){
 }
 
 /* ==========================
-카메라 시작/정리 (기존 유지)
+윈도우/모바일 공통: 카메라 목록
 ========================== */
-async function startCamera(){
+async function listCameras(){
+  try{
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cams = devices.filter(d => d.kind === "videoinput");
+    cameraSelect.innerHTML = "";
+
+    if(!cams.length){
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "카메라 없음/권한 필요";
+      cameraSelect.appendChild(opt);
+      return;
+    }
+
+    cams.forEach((cam, idx) => {
+      const opt = document.createElement("option");
+      opt.value = cam.deviceId;
+      opt.textContent = cam.label || `카메라 ${idx+1}`;
+      cameraSelect.appendChild(opt);
+    });
+
+    // 후면/Rear/Back 우선
+    const backIdx = cams.findIndex(c => /back|rear|후면/i.test(c.label));
+    if(backIdx >= 0) cameraSelect.selectedIndex = backIdx;
+  }catch(e){}
+}
+
+/* ==========================
+카메라 시작/정리
+- 인식률 위해 해상도/프레임레이트/초점 힌트 최대한 요청
+========================== */
+let currentDeviceId = "";
+
+async function startCamera(deviceId){
   stopAll();
 
   try{
+    currentDeviceId = deviceId || "";
+
+    const videoConstraints = {
+      // deviceId가 있으면 정확히 지정(Windows 웹캠 선택)
+      ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: "environment" } }),
+
+      // 인식률에 유리한 힌트(지원 시 적용)
+      width:  { ideal: 1920 },
+      height: { ideal: 1080 },
+      frameRate: { ideal: 30, max: 60 },
+
+      // 일부 브라우저에서 지원 (없어도 무시됨)
+      focusMode: "continuous"
+    };
+
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: "environment" } },
+      video: videoConstraints,
       audio: false
     });
 
     video.srcObject = stream;
     await video.play();
 
-    setStatus("QR 스캔 중…");
-    setupZoomControls();      // ✅ 줌 제어(추가)
-    startScanningLoop();      // ✅ 빠른 스캔 루프(개선)
+    // 권한 후 카메라 라벨이 생기므로 목록 갱신
+    await listCameras();
+    if(deviceId){
+      // 선택값 유지
+      cameraSelect.value = deviceId;
+    }
+
+    setStatus("QR 스캔 중… (모바일: 핀치/드래그, PC: 휠/드래그로 줌)");
+    setupCameraControls();     // ✅ 줌/토치/제스처
+    startScanningLoop();       // ✅ 인식률 강화 스캔 루프
 
   }catch(e){
-    setStatus("카메라 실행 실패");
+    setStatus("카메라 실행 실패 (HTTPS/권한/장치 확인)");
   }
 }
 
@@ -248,6 +329,7 @@ function stopAll(){
   navigating = false;
   scanning = false;
 
+  torchBtn.style.display = "none";
   zoomInfoEl.textContent = "";
 
   if(stream){
@@ -258,11 +340,12 @@ function stopAll(){
 }
 
 /* ==========================
-✅ QR 인식 속도 개선 스캔 루프
-- 중앙 ROI를 크롭해서 캔버스에 다운스케일로 그린 후 detect
-- requestVideoFrameCallback 지원 시 활용(더 안정적인 프레임 타이밍)
-- FPS 제한으로 detect 호출 과다 방지
+인식률 강화 스캔 루프
+- 가변 ROI + 다중 해상도 패스
+- 하드웨어 줌/디지털 줌 반영(ROI가 더 좁아져 확대 효과)
 ========================== */
+let digitalZoom = 1.0; // 하드웨어 줌 미지원 시에도 ROI 확대 효과
+
 function startScanningLoop(){
   if(!detector) return;
   if(scanning) return;
@@ -274,177 +357,220 @@ function startScanningLoop(){
 
   const tick = async (nowMs) => {
     if(!scanning || navigating) return;
-    if(!video.videoWidth || !video.videoHeight) {
-      scheduleNext(nowMs);
+    if(!video.videoWidth || !video.videoHeight){
+      scheduleNext();
       return;
     }
 
     // FPS 제한
     const minInterval = 1000 / TARGET_SCAN_FPS;
-    if(nowMs - lastScanTs < minInterval) {
-      scheduleNext(nowMs);
+    if(nowMs - lastScanTs < minInterval){
+      scheduleNext();
       return;
     }
     lastScanTs = nowMs;
 
-    // ROI 계산(중앙 크롭)
     const vw = video.videoWidth;
     const vh = video.videoHeight;
-    const roiW = Math.floor(vw * ROI_SIZE_RATIO);
-    const roiH = Math.floor(vh * ROI_SIZE_RATIO);
-    const sx = Math.floor((vw - roiW) / 2);
-    const sy = Math.floor((vh - roiH) / 2);
 
-    // 다운스케일 크기 결정(정사각에 가깝게)
-    const maxSide = Math.min(DOWNSCALE_MAX, Math.max(roiW, roiH));
-    const scale = maxSide / Math.max(roiW, roiH);
-    const dw = Math.max(1, Math.floor(roiW * scale));
-    const dh = Math.max(1, Math.floor(roiH * scale));
+    // ✅ 인식률 핵심: ROI 단계 + 해상도 패스
+    let found = null;
 
-    canvas.width = dw;
-    canvas.height = dh;
+    for(const passMaxSide of PASS_MAX_SIDES){
+      for(const baseRatio of ROI_STEPS){
+        // 디지털 줌이 커질수록 ROI는 더 좁아짐(줌인 효과)
+        const ratio = Math.min(1.0, baseRatio / digitalZoom);
 
-    // ROI만 캔버스에 그림(다운스케일)
-    ctx.drawImage(video, sx, sy, roiW, roiH, 0, 0, dw, dh);
+        const roiW = Math.max(1, Math.floor(vw * ratio));
+        const roiH = Math.max(1, Math.floor(vh * ratio));
+        const sx = Math.floor((vw - roiW) / 2);
+        const sy = Math.floor((vh - roiH) / 2);
 
-    try{
-      const codes = await detector.detect(canvas);
-      if(codes && codes.length){
-        const raw = (codes[0].rawValue || "").trim();
-        if(raw){
-          const now = Date.now();
-          if(raw !== lastValue || (now - lastTime) >= COOLDOWN_MS){
-            lastValue = raw;
-            lastTime = now;
+        const maxSide = Math.min(passMaxSide, Math.max(roiW, roiH));
+        const scale = maxSide / Math.max(roiW, roiH);
+        const dw = Math.max(1, Math.floor(roiW * scale));
+        const dh = Math.max(1, Math.floor(roiH * scale));
 
-            pushHistory(raw);
+        canvas.width = dw;
+        canvas.height = dh;
+        ctx.drawImage(video, sx, sy, roiW, roiH, 0, 0, dw, dh);
 
-            const url = makeUrl(raw);
-            vibrate(); beep();
-
-            if(!url){
-              setStatus("인식 성공! 그러나 URL 변환 실패 (BASE_URL 설정 필요)");
-              // 계속 스캔 유지
-              scheduleNext(nowMs);
-              return;
+        try{
+          const codes = await detector.detect(canvas);
+          if(codes && codes.length){
+            const raw = (codes[0].rawValue || "").trim();
+            if(raw){
+              found = raw;
+              break;
             }
-
-            navigating = true;
-            setStatus("이동 중…");
-            location.href = url;
-            return;
           }
+        }catch(e){
+          // 일시적 오류 무시
         }
       }
-    }catch(e){
-      // 일시적 오류 무시
+      if(found) break;
     }
 
-    scheduleNext(nowMs);
+    if(found){
+      const now = Date.now();
+      if(found !== lastValue || (now - lastTime) >= COOLDOWN_MS){
+        lastValue = found;
+        lastTime = now;
+
+        pushHistory(found);
+
+        const url = makeUrl(found);
+        vibrate(); beep();
+
+        if(!url){
+          setStatus("인식 성공! 그러나 URL 변환 실패 (BASE_URL 설정 필요)");
+          // 계속 스캔
+          scheduleNext();
+          return;
+        }
+
+        navigating = true;
+        setStatus("이동 중…");
+        location.href = url;
+        return;
+      }
+    }
+
+    scheduleNext();
   };
 
-  const scheduleNext = (nowMs) => {
+  const scheduleNext = () => {
     if(!scanning || navigating) return;
     if(useRVFC){
-      video.requestVideoFrameCallback((_, meta) => tick(meta?.mediaTime ? meta.mediaTime*1000 : performance.now()));
+      video.requestVideoFrameCallback((_, meta) => {
+        const t = meta?.mediaTime ? meta.mediaTime * 1000 : performance.now();
+        tick(t);
+      });
     }else{
-      // fallback: requestAnimationFrame
       requestAnimationFrame((t) => tick(t));
     }
   };
 
-  // 시작
-  if(useRVFC){
-    video.requestVideoFrameCallback((_, meta) => tick(meta?.mediaTime ? meta.mediaTime*1000 : performance.now()));
-  }else{
-    requestAnimationFrame((t) => tick(t));
-  }
+  scheduleNext();
 }
 
 /* ==========================
-✅ 줌인/줌아웃(드래그/핀치)
-- MediaStreamTrack zoom capability 지원 시 applyConstraints로 줌 적용
-- 1손가락 드래그(상/하)로 줌 변경
-- 2손가락 핀치로 줌 변경
+카메라 컨트롤(줌/토치)
+- 하드웨어 줌 지원 시: applyConstraints(zoom)
+- 미지원 시: 디지털 줌(digitalZoom)으로 ROI를 좁혀 인식률↑
+- 모바일: 핀치/드래그, PC: 마우스 휠/드래그
 ========================== */
 let videoTrack = null;
 let zoomCaps = null;
 let zoomValue = null;
 
-function setupZoomControls(){
-  try{
-    if(!stream) return;
-    videoTrack = stream.getVideoTracks()[0];
-    if(!videoTrack) return;
+let torchCaps = false;
+let torchOn = false;
 
+function clamp(v,min,max){ return Math.min(max, Math.max(min, v)); }
+
+function setupCameraControls(){
+  if(!stream) return;
+  videoTrack = stream.getVideoTracks()[0];
+  if(!videoTrack) return;
+
+  // --- 하드웨어 줌 capability 확인
+  zoomCaps = null; zoomValue = null;
+  try{
     if(typeof videoTrack.getCapabilities === "function"){
       const caps = videoTrack.getCapabilities();
       if(caps && caps.zoom){
         zoomCaps = caps.zoom; // {min,max,step}
-        // 초기값: settings에 zoom이 있으면 사용
-        let cur = null;
-        if(typeof videoTrack.getSettings === "function"){
-          const st = videoTrack.getSettings();
-          if(st && typeof st.zoom === "number") cur = st.zoom;
-        }
-        if(cur == null) cur = clamp((zoomCaps.min + zoomCaps.max) / 2, zoomCaps.min, zoomCaps.max);
-        zoomValue = cur;
-        updateZoomInfo(true);
-        enableZoomGestures();
-        return;
+        const st = (typeof videoTrack.getSettings === "function") ? videoTrack.getSettings() : {};
+        zoomValue = (st && typeof st.zoom === "number") ? st.zoom : (zoomCaps.min || 1);
       }
+      // torch
+      torchCaps = !!caps?.torch;
     }
+  }catch(e){}
 
-    // 지원 안 하면 안내만
-    zoomCaps = null;
-    zoomValue = null;
-    zoomInfoEl.textContent = "줌: 이 기기/브라우저는 카메라 줌 제어 미지원";
-  }catch(e){
-    zoomCaps = null;
-    zoomValue = null;
-    zoomInfoEl.textContent = "줌: 초기화 실패";
+  // --- 토치 버튼
+  if(torchCaps){
+    torchBtn.style.display = "";
+    torchBtn.textContent = torchOn ? "토치 ON" : "토치 OFF";
+  }else{
+    torchBtn.style.display = "none";
   }
+
+  torchBtn.onclick = async () => {
+    if(!videoTrack || !torchCaps) return;
+    torchOn = !torchOn;
+    try{
+      await videoTrack.applyConstraints({ advanced: [{ torch: torchOn }] });
+      torchBtn.textContent = torchOn ? "토치 ON" : "토치 OFF";
+    }catch(e){
+      // 적용 실패 시 원복
+      torchOn = !torchOn;
+      torchBtn.textContent = torchOn ? "토치 ON" : "토치 OFF";
+    }
+  };
+
+  // --- 줌 안내
+  if(zoomCaps){
+    updateZoomInfo();
+    // 초기값 적용
+    applyHardwareZoom(zoomValue);
+  }else{
+    updateZoomInfo(); // 디지털 줌 안내 포함
+  }
+
+  enableZoomGestures();
 }
 
-function clamp(v, min, max){ return Math.min(max, Math.max(min, v)); }
-
-function quantizeZoom(v){
+/* 하드웨어 줌 */
+function quantizeHardwareZoom(v){
   if(!zoomCaps) return v;
   const step = zoomCaps.step || 0.1;
   const q = Math.round(v / step) * step;
   return clamp(q, zoomCaps.min, zoomCaps.max);
 }
 
-async function applyZoom(newZoom){
+async function applyHardwareZoom(v){
   if(!videoTrack || !zoomCaps) return;
-  zoomValue = quantizeZoom(newZoom);
+  zoomValue = quantizeHardwareZoom(v);
   try{
     await videoTrack.applyConstraints({ advanced: [{ zoom: zoomValue }] });
-    updateZoomInfo(false);
+    updateZoomInfo();
   }catch(e){
-    // 어떤 기기는 applyConstraints를 거부할 수 있음
-    zoomInfoEl.textContent = "줌: 적용 실패(기기 제한)";
+    // 실패 시 하드웨어 줌을 포기하고 디지털 줌 사용
+    zoomCaps = null;
+    zoomValue = null;
+    updateZoomInfo();
   }
 }
 
-function updateZoomInfo(init){
-  if(!zoomCaps || zoomValue == null) return;
-  const pct = Math.round(((zoomValue - zoomCaps.min) / (zoomCaps.max - zoomCaps.min)) * 100);
-  zoomInfoEl.textContent = `줌: ${zoomValue.toFixed(2)} (${pct}%)  ·  드래그/핀치로 조절`;
-  if(init){
-    // 처음엔 현재 값을 즉시 적용해 일관성 맞춤
-    applyZoom(zoomValue);
-  }
+/* 디지털 줌: ROI 좁히기(인식률↑) */
+function applyDigitalZoom(z){
+  digitalZoom = clamp(z, DIGITAL_ZOOM_MIN, DIGITAL_ZOOM_MAX);
+  updateZoomInfo();
 }
 
-/* 포인터 기반 제스처 */
-const pointers = new Map(); // id -> {x,y}
-let startZoom = null;
+function updateZoomInfo(){
+  const hw = zoomCaps ? `하드웨어 줌: ${zoomValue?.toFixed?.(2) ?? ""}` : "하드웨어 줌: 미지원";
+  const dz = `디지털 줌: ${digitalZoom.toFixed(2)} (PC/웹캠에서도 동작)`;
+  zoomInfoEl.textContent =
+    `${hw} · ${dz}  |  모바일: 핀치/드래그, PC: 휠/드래그`;
+}
+
+/* 제스처(포인터) */
+const pointers = new Map();
+let startZoomHW = null;
+let startZoomDZ = null;
 let startDist = null;
 let startY = null;
 
+function distance(a,b){
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  return Math.hypot(dx,dy);
+}
+
 function enableZoomGestures(){
-  // 이미 등록된 핸들러 중복 방지
   video.onpointerdown = null;
   video.onpointermove = null;
   video.onpointerup = null;
@@ -452,104 +578,121 @@ function enableZoomGestures(){
   video.onpointerleave = null;
 
   video.addEventListener("pointerdown", (e) => {
-    if(!zoomCaps) return;
     video.setPointerCapture?.(e.pointerId);
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
+    // 기준값 저장
+    startZoomHW = zoomValue;
+    startZoomDZ = digitalZoom;
+
     if(pointers.size === 1){
-      startZoom = zoomValue;
       startY = e.clientY;
       startDist = null;
     }else if(pointers.size === 2){
       const pts = Array.from(pointers.values());
       startDist = distance(pts[0], pts[1]);
-      startZoom = zoomValue;
       startY = null;
     }
   });
 
   video.addEventListener("pointermove", (e) => {
-    if(!zoomCaps) return;
     if(!pointers.has(e.pointerId)) return;
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
+    // 1손가락 드래그(상/하): 위로 = 줌인
     if(pointers.size === 1 && startY != null){
-      // 1손가락 드래그(상/하): 위로 드래그 => 줌인
-      const dy = startY - e.clientY; // 위로 이동하면 +
-      const range = (zoomCaps.max - zoomCaps.min);
-      const factor = dy / 300;       // 300px 드래그에 range의 일부 반영
-      const next = startZoom + (range * factor * 0.35);
-      applyZoom(next);
-    }else if(pointers.size === 2 && startDist != null){
-      // 핀치
+      const dy = startY - e.clientY;
+      const delta = dy / 260; // 민감도
+      if(zoomCaps){
+        const range = (zoomCaps.max - zoomCaps.min);
+        applyHardwareZoom((startZoomHW ?? zoomValue ?? zoomCaps.min) + range * delta * 0.35);
+      }else{
+        applyDigitalZoom((startZoomDZ ?? digitalZoom) + delta * 0.9);
+      }
+    }
+
+    // 2손가락 핀치
+    if(pointers.size === 2 && startDist != null){
       const pts = Array.from(pointers.values());
       const d = distance(pts[0], pts[1]);
       const ratio = d / startDist; // >1 확대
-      // ratio를 줌 범위로 매핑(완만하게)
-      const next = startZoom * ratio;
-      applyZoom(next);
+      if(zoomCaps){
+        applyHardwareZoom((startZoomHW ?? zoomValue ?? zoomCaps.min) * ratio);
+      }else{
+        applyDigitalZoom((startZoomDZ ?? digitalZoom) * ratio);
+      }
     }
   });
 
   const end = (e) => {
-    if(pointers.has(e.pointerId)) pointers.delete(e.pointerId);
-    if(pointers.size < 2){
-      startDist = null;
-    }
+    pointers.delete(e.pointerId);
+    if(pointers.size < 2) startDist = null;
     if(pointers.size === 0){
-      startZoom = null;
-      startY = null;
-      startDist = null;
-    }else if(pointers.size === 1){
-      // 남은 1개로 전환 시 기준 재설정
-      const pt = Array.from(pointers.values())[0];
-      startZoom = zoomValue;
-      startY = pt.y;
-      startDist = null;
+      startY = null; startDist = null;
     }
   };
 
   video.addEventListener("pointerup", end);
   video.addEventListener("pointercancel", end);
   video.addEventListener("pointerleave", end);
-}
 
-function distance(a,b){
-  const dx = a.x - b.x;
-  const dy = a.y - b.y;
-  return Math.hypot(dx, dy);
+  // ✅ Windows/PC: 마우스 휠 줌
+  video.onwheel = (e) => {
+    e.preventDefault();
+    const delta = Math.sign(e.deltaY); // 아래로 +1, 위로 -1
+    if(zoomCaps){
+      const step = zoomCaps.step || 0.1;
+      applyHardwareZoom((zoomValue ?? zoomCaps.min) + (delta * step));
+    }else{
+      applyDigitalZoom(digitalZoom + (delta * 0.12));
+    }
+  };
+
+  // ✅ Windows/PC: 드래그 줌도 동일하게 동작(포인터 이벤트가 마우스도 포함)
 }
 
 /* ==========================
-시작 버튼 (기존 유지)
+카메라 전환 (Windows 호환 핵심)
+========================== */
+cameraSelect.addEventListener("change", async () => {
+  const id = cameraSelect.value;
+  if(!id) return;
+  // 스캔 중이면 즉시 전환
+  await startCamera(id);
+});
+
+/* ==========================
+시작 버튼(사용자 제스처 확보)
 ========================== */
 startBtn.addEventListener("click", async () => {
   await requestFullscreen();
 
+  // 오디오 권한 확보
   try{
-    if(!audioCtx){
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    if(audioCtx.state === "suspended"){
-      await audioCtx.resume();
-    }
+    if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if(audioCtx.state === "suspended") await audioCtx.resume();
   }catch(e){}
 
   const ok = initDetector();
   if(!ok) return;
 
+  // 권한 획득 전에도 목록은 보이게(라벨은 빈 값일 수 있음)
+  await listCameras();
+
   tapLayer.style.display = "none";
-  await startCamera();
+  await startCamera(cameraSelect.value || "");
 });
 
-/* 화면 탭으로도 시작 (기존 유지) */
+/* 화면 탭으로도 시작 */
 tapLayer.addEventListener("click", (e) => {
   if(e.target === startBtn) return;
   startBtn.click();
 });
 
+/* 초기 카메라 목록(권한 전에는 label이 비어도 OK) */
+listCameras();
+
 window.addEventListener("beforeunload", stopAll);
 </script>
 </body>
 </html>
-
